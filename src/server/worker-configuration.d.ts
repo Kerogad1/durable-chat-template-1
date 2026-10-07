@@ -4,6 +4,7 @@
 declare namespace Cloudflare {
 	interface Env {
 		Chat: DurableObjectNamespace<import("./index").Chat>;
+		RemoteRoom: DurableObjectNamespace<import("./index").RemoteRoom>;
 		ASSETS: Fetcher;
 	}
 }
