@@ -143,8 +143,7 @@ export class Chat extends Server<Env> {
     },
   ) {
     const url = new URL(
-      connection.uri ||
-        context.request.url,
+      context.request.url,
     );
 
     const role =
@@ -586,26 +585,36 @@ export default {
         );
       }
 
-      const id =
-        env.Chat.idFromName(code);
-
-      const stub =
-        env.Chat.get(id);
-
       /*
-       * PartyServer يحتاج room name عند الاستدعاء المباشر
-       * لأنه لم يمر عبر routePartykitRequest.
+       * PartyServer يدعم المسار القياسي:
+       * /parties/chat/:room
+       *
+       * بدل محاولة استدعاء Durable Object مباشرة،
+       * نعيد توجيه طلب WebSocket إلى نفس الـrouter الرسمي.
        */
-      const forwarded =
-        new Request(request);
+      const routedUrl =
+        new URL(
+          `/parties/chat/${encodeURIComponent(code)}`,
+          request.url,
+        );
 
-      forwarded.headers.set(
-        "x-partykit-room",
-        code,
-      );
+      routedUrl.search = url.search;
 
-      return stub.fetch(
-        forwarded,
+      const routedRequest =
+        new Request(
+          routedUrl,
+          request,
+        );
+
+      return (
+        (await routePartykitRequest(
+          routedRequest,
+          { ...env },
+        )) ||
+        new Response(
+          "WebSocket route not found",
+          { status: 404 },
+        )
       );
     }
 
