@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Remote — Controller POC</title>
+  <style>
+    body {
+      font-family: system-ui;
+      background: #0f172a;
+      color: #e2e8f0;
+      margin: 0
+    }
+
+    .wrap {
+      max-width: 900px;
+      margin: 30px auto;
+      padding: 20px
+    }
+
+    .card {
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 18px;
+      margin-bottom: 16px
+    }
+
+    input,
+    button {
+      font: inherit;
+      border-radius: 10px;
+      border: 1px solid #475569;
+      padding: 10px
+    }
+
+    input {
+      background: #0b1220;
+      color: #fff;
+      width: 100%;
+      box-sizing: border-box
+    }
+
+    button {
+      background: #1d4ed8;
+      color: #fff;
+      cursor: pointer;
+      margin: 4px
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap
+    }
+
+    .status {
+      font-weight: 700
+    }
+
+    .ok {
+      color: #22c55e
+    }
+
+    .bad {
+      color: #ef4444
+    }
+
+    #screen {
+      width: 100%;
+      max-width: 420px;
+      aspect-ratio: 9/19;
+      border: 1px dashed #64748b;
+      border-radius: 14px;
+      display: block;
+      margin: 10px auto;
+      background: #020617;
+      object-fit: contain
+    }
+
+    .pad {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      max-width: 360px;
+      margin: auto
+    }
+
+    .wide {
+      grid-column: span 3
+    }
+
+    small {
+      color: #94a3b8
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <h1>Remote — Controller</h1>
+    <div class="card">
+      <label>WebSocket URL</label><input id="url" value="ws://localhost:8080" />
+      <label>Pair code</label><input id="code" placeholder="Example: 8F3A91C2" />
+      <div class="row"><button id="connect">اتصال</button><span id="status" class="status bad">غير متصل</span></div>
+      <small>هذه النسخة الأولى لا تنفذ مشاركة الشاشة بعد؛ هدفها إثبات الاتصال وتنفيذ أوامر اللمس الأساسية.</small>
+    </div>
+
+    <div class="card">
+      <h2>Remote Controls</h2>
+      <div class="pad">
+        <button onclick="cmd({type:'nav', action:'back'})">رجوع</button>
+        <button onclick="cmd({type:'tap', x:.5, y:.5})">Tap</button>
+        <button onclick="cmd({type:'nav', action:'home'})">Home</button>
+        <button onclick="cmd({type:'swipe', x1:.5,y1:.8,x2:.5,y2:.2,duration:450})">↑ Swipe</button>
+        <button class="wide" onclick="cmd({type:'test'})">اختبار اتصال</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Screen</h2>
+      <div id="screen">سيتم وضع بث الشاشة هنا في المرحلة التالية.</div>
+    </div>
+  </div>
+  <script>
+
+    let ws;
+
+    const status = document.getElementById('status');
+
+    function setStatus(ok) {
+      status.textContent = ok ? 'متصل' : 'غير متصل';
+      status.className = 'status ' + (ok ? 'ok' : 'bad');
+    }
+
+    function connect() {
+
+      const base = document.getElementById('url').value.replace(/\/$/, '');
+      const code = encodeURIComponent(
+        document.getElementById('code').value.trim()
+      );
+
+      ws = new WebSocket(
+        `${base}/?role=controller&code=${code}`
+      );
+
+      ws.onopen = () => setStatus(true);
+
+      ws.onclose = () => setStatus(false);
+
+      ws.onerror = () => setStatus(false);
+
+      ws.onmessage = (e) => {
+        console.log('agent:', e.data);
+
+        try {
+          const msg = JSON.parse(e.data);
+
+          if (msg.type === 'test_ok') {
+            alert('✅ اختبار الاتصال ناجح — الموبايل استقبل الأمر ورد بنجاح');
+          }
+
+        } catch (err) {
+          console.log('رد غير JSON:', e.data);
+        }
+      };
+    }
+
+    function cmd(message) {
+
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        alert('اتصل أولًا');
+        return;
+      }
+
+      ws.send(JSON.stringify(message));
+    }
+
+    document.getElementById('connect').onclick = connect;
+
+  </script>
