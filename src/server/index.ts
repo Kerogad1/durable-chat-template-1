@@ -1,633 +1,276 @@
-import {
-  type Connection,
-  Server,
-  type WSMessage,
-  routePartykitRequest,
-} from "partyserver";
+import { DurableObject } from "cloudflare:workers";
 
-type RemoteRole = "agent" | "controller";
-
-type RemoteConnectionState = {
-  role: RemoteRole;
-  deviceId: string;
-  deviceName: string;
+type RemoteSession = {
+  role: "agent" | "controller";
+  deviceId?: string;
+  deviceName?: string;
 };
 
-function sendJson(
-  connection: Connection,
-  message: Record<string, unknown>,
-) {
+function value(v: string | null): string | undefined {
+  const s = v?.trim();
+  return s || undefined;
+}
+
+function isWebSocket(request: Request): boolean {
+  return request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+}
+
+function safeSend(ws: WebSocket, data: string | ArrayBuffer): void {
+  try { ws.send(data); } catch {}
+}
+
+function safeJson(ws: WebSocket, data: Record<string, unknown>): void {
+  safeSend(ws, JSON.stringify(data));
+}
+
+function parseText(text: string): Record<string, unknown> | null {
   try {
-    connection.send(JSON.stringify(message));
-  } catch (error) {
-    console.error("[REMOTE SEND ERROR]", error);
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
   }
 }
 
-export class Chat extends Server<Env> {
-  static options = {
-    hibernate: true,
-  };
+export class RemoteRoom extends DurableObject {
+  private sessions = new Map<WebSocket, RemoteSession>();
 
-  private getState(
-    connection: Connection,
-  ): RemoteConnectionState | null {
-    const state = connection.state as
-      | Partial<RemoteConnectionState>
-      | null
-      | undefined;
-
-    if (
-      !state ||
-      (state.role !== "agent" &&
-        state.role !== "controller")
-    ) {
-      return null;
-    }
-
-    return {
-      role: state.role,
-      deviceId: state.deviceId || "",
-      deviceName:
-        state.deviceName || "Android",
-    };
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
   }
 
-  private getController(): Connection | null {
-    for (const connection of this.getConnections()) {
-      const state = this.getState(connection);
-
-      if (state?.role === "controller") {
-        return connection;
-      }
-    }
-
-    return null;
+  private allAgents() {
+    return [...this.sessions.entries()].filter(([, state]) => state.role === "agent");
   }
 
-  private getAgentConnections(): Connection[] {
-    return [...this.getConnections()].filter(
-      (connection) =>
-        this.getState(connection)?.role ===
-        "agent",
-    );
+  private allControllers() {
+    return [...this.sessions.entries()].filter(([, state]) => state.role === "controller");
   }
 
-  private getDeviceList() {
-    return this.getAgentConnections().map(
-      (connection) => {
-        const state = this.getState(connection);
+  private findAgent(deviceId: string) {
+    return this.allAgents().find(([, state]) => state.deviceId === deviceId)?.[0];
+  }
 
-        return {
-          deviceId: state?.deviceId || connection.id,
-          deviceName:
-            state?.deviceName ||
-            `Android ${(
-              state?.deviceId ||
-              connection.id
-            ).slice(-4)}`,
-          online: true,
-        };
-      },
-    );
+  private deviceList() {
+    return this.allAgents().map(([, state]) => ({
+      deviceId: state.deviceId ?? "",
+      deviceName: state.deviceName ?? "جهاز Android",
+      online: true,
+    }));
   }
 
   private sendDeviceList() {
-    const controller = this.getController();
-
-    if (!controller) {
-      return;
-    }
-
-    const devices = this.getDeviceList();
-
-    console.log(
-      "[REMOTE] DEVICE LIST",
-      devices,
-    );
-
-    sendJson(controller, {
-      type: "device_list",
-      devices,
-    });
+    const payload = { type: "device_list", devices: this.deviceList() };
+    for (const [ws] of this.allControllers()) safeJson(ws, payload);
   }
 
-  private sendError(
-    connection: Connection,
-    message: string,
-  ) {
-    sendJson(connection, {
-      type: "error",
-      message,
-    });
+  private forwardToAgent(deviceId: string, data: string | ArrayBuffer) {
+    const ws = this.findAgent(deviceId);
+    if (!ws) return false;
+    safeSend(ws, data);
+    return true;
   }
 
-  private findAgent(
-    deviceId: string,
-  ): Connection | null {
-    for (const connection of this.getAgentConnections()) {
-      const state = this.getState(connection);
-
-      if (state?.deviceId === deviceId) {
-        return connection;
-      }
+  private forwardToControllers(deviceId: string, data: string | ArrayBuffer) {
+    for (const [ws] of this.allControllers()) {
+      safeSend(ws, data);
     }
-
-    return null;
   }
 
-  onConnect(
-    connection: Connection,
-    context: {
-      request: Request;
-    },
-  ) {
-    const url = new URL(
-      context.request.url,
-    );
-
-    const role =
-      url.searchParams.get("role") as
-        | RemoteRole
-        | null;
-
-    const code =
-      url.searchParams.get("code")?.trim() ||
-      "";
-
-    const deviceId =
-      url.searchParams.get("deviceId")?.trim() ||
-      "";
-
-    const deviceName =
-      url.searchParams.get("deviceName")?.trim() ||
-      "";
-
-    if (
-      role !== "agent" &&
-      role !== "controller"
-    ) {
-      console.error(
-        "[REMOTE] Invalid role:",
-        role,
-      );
-
-      connection.close(
-        1008,
-        "Invalid role",
-      );
-
-      return;
-    }
-
-    if (!code) {
-      console.error(
-        "[REMOTE] Missing pair code",
-      );
-
-      connection.close(
-        1008,
-        "Missing pair code",
-      );
-
-      return;
-    }
-
-    if (
-      role === "agent" &&
-      !deviceId
-    ) {
-      console.error(
-        "[REMOTE] Agent missing deviceId",
-      );
-
-      connection.close(
-        1008,
-        "Missing deviceId",
-      );
-
-      return;
-    }
-
-    /*
-     * كل اتصال يحمل بياناته داخل state.
-     * state يستمر مع PartyServer/hibernation لنفس اتصال WebSocket.
-     */
-    connection.setState({
-      role,
-      deviceId:
-        role === "agent"
-          ? deviceId
-          : "",
-      deviceName:
-        role === "agent"
-          ? deviceName ||
-            `Android ${deviceId.slice(-4)}`
-          : "Remote Controller",
-    } satisfies RemoteConnectionState);
-
-    console.log(
-      "[REMOTE] CONNECT",
-      {
-        role,
-        deviceId,
-        code,
-        room: this.name,
-      },
-    );
-
-    /*
-     * نسمح بـ Controller واحد لكل غرفة.
-     */
-    if (role === "controller") {
-      const oldController =
-        this.getController();
-
-      if (
-        oldController &&
-        oldController.id !== connection.id
-      ) {
-        oldController.close(
-          1000,
-          "Replaced by newer controller",
-        );
-      }
-
-      sendJson(connection, {
-        type: "hello",
-        role: "controller",
-        pairCode: code,
-      });
-
-      this.sendDeviceList();
-
-      return;
-    }
-
-    /*
-     * نفس الهاتف لا يحتفظ بأكثر من اتصال Agent واحد.
-     */
-    const oldAgent =
-      this.findAgent(deviceId);
-
-    if (
-      oldAgent &&
-      oldAgent.id !== connection.id
-    ) {
-      oldAgent.close(
-        1000,
-        "Replaced by newer connection",
-      );
-    }
-
-    sendJson(connection, {
-      type: "hello",
-      role: "agent",
-      pairCode: code,
-      deviceId,
-    });
-
-    this.sendDeviceList();
-
-    const controller =
-      this.getController();
-
-    if (controller) {
-      sendJson(controller, {
-        type: "peer",
-        online: true,
-        deviceId,
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("X-Remote-Debug") === "1") {
+      return Response.json({
+        ok: true,
+        durableObject: "RemoteRoom",
+        devices: this.deviceList(),
+        sessions: this.sessions.size,
       });
     }
-  }
 
-  onMessage(
-    connection: Connection,
-    message: WSMessage,
-  ) {
-    const state =
-      this.getState(connection);
+    if (!isWebSocket(request)) return new Response("WebSocket endpoint", { status: 426 });
 
-    if (!state) {
-      this.sendError(
-        connection,
-        "Connection state is missing",
-      );
-      return;
+    const url = new URL(request.url);
+    const role = value(url.searchParams.get("role"));
+    if (role !== "agent" && role !== "controller") {
+      return new Response("Invalid role", { status: 400 });
     }
 
-    /*
-     * Agent -> Controller
-     */
-    if (state.role === "agent") {
-      const controller =
-        this.getController();
+    const pairCode = value(url.searchParams.get("code"));
+    if (!pairCode) return new Response("Missing pair code", { status: 400 });
 
-      if (!controller) {
-        console.log(
-          "[REMOTE] Agent message dropped: no controller",
-        );
-        return;
-      }
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.accept();
 
-      /*
-       * بث الشاشة/الكاميرا يصل كـ binary.
-       * نمرره فقط للـ Controller الحالي.
-       */
-      if (
-        typeof message !== "string"
-      ) {
-        try {
-          controller.send(
-            message as ArrayBuffer,
-          );
-        } catch (error) {
-          console.error(
-            "[REMOTE] Binary forward error:",
-            error,
-          );
+    if (role === "agent") {
+      const deviceId = value(url.searchParams.get("deviceId")) ?? ("device-" + crypto.randomUUID());
+      const deviceName = value(url.searchParams.get("deviceName")) ?? "جهاز Android";
+
+      for (const [oldWs, oldState] of this.allAgents()) {
+        if (oldState.deviceId === deviceId) {
+          try { oldWs.close(4000, "Replaced"); } catch {}
+          this.sessions.delete(oldWs);
         }
-
-        return;
       }
 
-      let msg: Record<string, unknown>;
+      this.sessions.set(server, { role: "agent", deviceId, deviceName });
 
-      try {
-        msg = JSON.parse(message) as Record<
-          string,
-          unknown
-        >;
-      } catch {
-        console.error(
-          "[REMOTE] Invalid JSON from agent:",
-          message,
-        );
-        return;
-      }
+      console.log("[REMOTE] AGENT CONNECT", deviceId);
 
-      if (!msg.deviceId) {
-        msg.deviceId = state.deviceId;
-      }
+      safeJson(server, {
+        type: "connection_status",
+        connected: true,
+        role: "agent",
+        deviceId,
+      });
 
-      console.log(
-        "[REMOTE] AGENT -> CONTROLLER",
-        {
-          type: msg.type,
-          deviceId:
-            msg.deviceId,
-        },
-      );
+      safeJson(server, {
+        type: "hello",
+        role: "agent",
+        deviceId,
+        deviceName,
+      });
 
-      sendJson(
-        controller,
-        msg,
-      );
-
-      return;
-    }
-
-    /*
-     * Controller -> Agent
-     */
-    if (typeof message !== "string") {
-      this.sendError(
-        connection,
-        "Binary messages are not accepted from controller",
-      );
-      return;
-    }
-
-    let msg: Record<string, unknown>;
-
-    try {
-      msg = JSON.parse(message) as Record<
-        string,
-        unknown
-      >;
-    } catch {
-      this.sendError(
-        connection,
-        "Invalid JSON",
-      );
-      return;
-    }
-
-    const type =
-      typeof msg.type === "string"
-        ? msg.type
-        : "";
-
-    console.log(
-      "[REMOTE] CONTROLLER MESSAGE",
-      {
-        type,
-        deviceId:
-          msg.deviceId || "",
-      },
-    );
-
-    /*
-     * طلب الأجهزة يعالجه Cloudflare نفسه
-     * ولا يصل إلى أي هاتف.
-     */
-    if (type === "get_devices") {
       this.sendDeviceList();
-      return;
+    } else {
+      for (const [oldWs] of this.allControllers()) {
+        try { oldWs.close(4000, "Replaced"); } catch {}
+        this.sessions.delete(oldWs);
+      }
+
+      this.sessions.set(server, { role: "controller" });
+
+      console.log("[REMOTE] CONTROLLER CONNECT");
+
+      safeJson(server, { type: "connection_status", connected: true, role: "controller" });
+      safeJson(server, { type: "hello", role: "controller" });
+      safeJson(server, { type: "device_list", devices: this.deviceList() });
     }
 
-    const targetDeviceId =
-      typeof msg.deviceId === "string"
-        ? msg.deviceId.trim()
-        : "";
+    server.addEventListener("message", (event) => {
+      const state = this.sessions.get(server);
+      if (!state) return;
 
-    if (!targetDeviceId) {
-      this.sendError(
-        connection,
-        "deviceId is required",
-      );
-      return;
-    }
+      if (typeof event.data !== "string") {
+        if (state.role === "agent" && state.deviceId) {
+          this.forwardToControllers(state.deviceId, event.data);
+        }
+        return;
+      }
 
-    const target =
-      this.findAgent(targetDeviceId);
+      const data = parseText(event.data);
+      if (!data) {
+        safeJson(server, { type: "error", message: "Invalid JSON" });
+        return;
+      }
 
-    if (!target) {
-      this.sendError(
-        connection,
-        `Device ${targetDeviceId} is not connected`,
-      );
+      const type = typeof data.type === "string" ? data.type : "";
 
-      console.log(
-        "[REMOTE] TARGET NOT FOUND",
-        targetDeviceId,
-      );
+      if (state.role === "agent") {
+        const deviceId = state.deviceId ?? "";
+        this.forwardToControllers(deviceId, JSON.stringify({ ...data, deviceId }));
+        return;
+      }
 
-      return;
-    }
+      if (type === "get_devices") {
+        safeJson(server, { type: "device_list", devices: this.deviceList() });
+        return;
+      }
 
-    console.log(
-      "[REMOTE] CONTROLLER -> AGENT",
-      {
-        type,
-        deviceId:
-          targetDeviceId,
-      },
-    );
+      const targetDeviceId = typeof data.deviceId === "string" ? data.deviceId.trim() : "";
+      if (!targetDeviceId) {
+        safeJson(server, { type: "error", message: "deviceId is required" });
+        return;
+      }
 
-    sendJson(
-      target,
-      msg,
-    );
+      if (!this.findAgent(targetDeviceId)) {
+        safeJson(server, { type: "error", message: "الجهاز غير متصل", deviceId: targetDeviceId });
+        return;
+      }
+
+      console.log("[REMOTE] COMMAND", type, targetDeviceId);
+      this.forwardToAgent(targetDeviceId, JSON.stringify({ ...data, deviceId: targetDeviceId }));
+    });
+
+    const cleanup = () => {
+      this.sessions.delete(server);
+      console.log("[REMOTE] DISCONNECT");
+      this.sendDeviceList();
+    };
+
+    server.addEventListener("close", cleanup);
+    server.addEventListener("error", cleanup);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+}
+
+export class Chat extends DurableObject {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
   }
 
-  onClose(
-    connection: Connection,
-    code: number,
-    reason: string,
-    _wasClean: boolean,
-  ) {
-    const state =
-      this.getState(connection);
-
-    console.log(
-      "[REMOTE] CLOSE",
-      {
-        role: state?.role || "unknown",
-        deviceId:
-          state?.deviceId || "",
-        code,
-        reason,
-      },
-    );
-
-    /*
-     * بعد إغلاق الاتصال، getConnections()
-     * لن يعيد هذا الاتصال، لذلك إرسال القائمة
-     * هنا يكفي لتحديث Controller.
-     */
-    this.sendDeviceList();
-
-    if (
-      state?.role === "agent"
-    ) {
-      const controller =
-        this.getController();
-
-      if (controller) {
-        sendJson(controller, {
-          type: "peer",
-          online: false,
-          deviceId:
-            state.deviceId,
-        });
-      }
-    }
+  async fetch(): Promise<Response> {
+    return new Response("Legacy chat namespace", { status: 410 });
   }
 }
 
 export default {
-  async fetch(
-    request: Request,
-    env: Env,
-  ) {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    /*
-     * Health check بسيط لـ Cloudflare.
-     * لا يعرض كود الاقتران.
-     */
-    if (
-      url.pathname === "/health" &&
-      request.method === "GET"
-    ) {
-      return new Response(
-        JSON.stringify({
-          ok: true,
-          service: "remote-device-poc-cloudflare",
-        }),
-        {
-          status: 200,
-          headers: {
-            "content-type":
-              "application/json",
-          },
-        },
-      );
+    if (!isWebSocket(request) && (url.pathname === "/" || url.pathname === "/health")) {
+      return Response.json({
+        ok: true,
+        service: "remote-device-cloud",
+        websocket: true,
+      });
     }
 
-    /*
-     * تطبيق Android الحالي يرسل WebSocket
-     * إلى نفس serverUrl مباشرة، ثم يضيف:
-     *   ?role=...&code=...
-     *
-     * لذلك ندعم root WebSocket أيضًا.
-     *
-     * كل pair code يصبح غرفة Durable Object مستقلة.
-     */
-    if (
-      url.pathname === "/" &&
-      request.headers
-        .get("Upgrade")
-        ?.toLowerCase() ===
-        "websocket"
-    ) {
-      const code =
-        url.searchParams
-          .get("code")
-          ?.trim()
-          .toUpperCase() || "";
+    const configuredPairCode = value(env.PAIR_CODE ?? null);
+    if (!configuredPairCode) return new Response("PAIR_CODE is not configured", { status: 500 });
 
-      if (!code) {
-        return new Response(
-          "Missing pair code",
-          { status: 400 },
-        );
+    const requestedCode = value(url.searchParams.get("code"));
+    if (requestedCode !== configuredPairCode) return new Response("Invalid pair code", { status: 401 });
+
+    const role = value(url.searchParams.get("role"));
+    if (role !== "agent" && role !== "controller") {
+      return new Response("Invalid role", { status: 400 });
+    }
+
+    const namespace = env.RemoteRoom;
+    if (!namespace) return new Response("RemoteRoom binding is missing", { status: 500 });
+
+    const id = namespace.idFromName(configuredPairCode);
+    const stub = namespace.get(id);
+
+    if (!isWebSocket(request)) {
+      if (url.pathname === "/debug-do") {
+        const debugRequest = new Request(request, {
+          headers: new Headers({ "X-Remote-Debug": "1" }),
+        });
+        try {
+          return await stub.fetch(debugRequest);
+        } catch (error) {
+          return new Response(
+            "Durable Object binding error: " + (error instanceof Error ? error.message : String(error)),
+            { status: 500 },
+          );
+        }
       }
-
-      /*
-       * PartyServer يدعم المسار القياسي:
-       * /parties/chat/:room
-       *
-       * بدل محاولة استدعاء Durable Object مباشرة،
-       * نعيد توجيه طلب WebSocket إلى نفس الـrouter الرسمي.
-       */
-      const routedUrl =
-        new URL(
-          `/parties/chat/${encodeURIComponent(code)}`,
-          request.url,
-        );
-
-      routedUrl.search = url.search;
-
-      const routedRequest =
-        new Request(
-          routedUrl,
-          request,
-        );
-
-      return (
-        (await routePartykitRequest(
-          routedRequest,
-          { ...env },
-        )) ||
-        new Response(
-          "WebSocket route not found",
-          { status: 404 },
-        )
-      );
+      return new Response("WebSocket endpoint ready", { status: 426 });
     }
 
-    /*
-     * المسار القياسي لـ PartyServer:
-     * /parties/:party/:room
-     */
-    return (
-      (await routePartykitRequest(
-        request,
-        { ...env },
-      )) ||
-      env.ASSETS.fetch(request)
-    );
+    try {
+      return await stub.fetch(request);
+    } catch (error) {
+      console.error("Durable Object fetch failed", error);
+      return new Response(
+        "Durable Object error: " + (error instanceof Error ? error.message : String(error)),
+        { status: 500 },
+      );
+    }
   },
 } satisfies ExportedHandler<Env>;
