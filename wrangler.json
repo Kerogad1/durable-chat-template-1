@@ -4,8 +4,16 @@
   "name": "durable-chat-template",
   "migrations": [
     {
-      "new_sqlite_classes": ["Chat"],
+      "new_sqlite_classes": [
+        "Chat"
+      ],
       "tag": "v1"
+    },
+    {
+      "new_classes": [
+        "RemoteRoom"
+      ],
+      "tag": "v2"
     }
   ],
   "assets": {
@@ -18,6 +26,10 @@
   },
   "durable_objects": {
     "bindings": [
+      {
+        "class_name": "RemoteRoom",
+        "name": "RemoteRoom"
+      },
       {
         "class_name": "Chat",
         "name": "Chat"
